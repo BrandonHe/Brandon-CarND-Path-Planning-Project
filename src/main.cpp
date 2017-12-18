@@ -201,7 +201,18 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  // start in lane 1
+  int lane = 1; //0 is far left, 1 is next to the right
+  int lanes = 3;
+  int laneWidth = 4; //Width of lanes in meters
+
+  // have a reference velocity for target
+  double ref_vel = 0; //mph
+  double target_speed = 49.5; // target speed
+  double speed_limit = 49.5; // speed limit, no exceed
+  double last_lane_change = 0.0; // distance since last lane change
+
+  h.onMessage([&ref_vel,&lane,&lanes,&speed_limit, &target_speed,&laneWidth,&last_lane_change,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -221,40 +232,292 @@ int main() {
           // j[1] is the data JSON object
           
         	// Main car's localization Data
-          	double car_x = j[1]["x"];
-          	double car_y = j[1]["y"];
-          	double car_s = j[1]["s"];
-          	double car_d = j[1]["d"];
-          	double car_yaw = j[1]["yaw"];
-          	double car_speed = j[1]["speed"];
+          double car_x = j[1]["x"];
+          double car_y = j[1]["y"];
+          double car_s = j[1]["s"];
+          double car_d = j[1]["d"];
+          double car_yaw = j[1]["yaw"];
+          double car_speed = j[1]["speed"];
 
-          	// Previous path data given to the Planner
-          	auto previous_path_x = j[1]["previous_path_x"];
-          	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
-          	double end_path_s = j[1]["end_path_s"];
-          	double end_path_d = j[1]["end_path_d"];
+          // Cost for lane changes and maintain lane, maintain has priority by initialization to 0
+          double leftLCCost = 99;
+          double rightLCCost = 99;
+          double maintainLCost = 0;
+          // Count how many cars are in each lane, used for lane cost later
+          int leftCarCount = 0;
+          int rightCarCount = 0;
 
-          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-          	auto sensor_fusion = j[1]["sensor_fusion"];
+          // Previous path data given to the Planner
+          auto previous_path_x = j[1]["previous_path_x"];
+          auto previous_path_y = j[1]["previous_path_y"];
+          // Previous path's end s and d values 
+          double end_path_s = j[1]["end_path_s"];
+          double end_path_d = j[1]["end_path_d"];
 
-          	json msgJson;
+          // Sensor Fusion Data, a list of all other cars on the same side of the road.
+          auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+			    int prev_size = previous_path_x.size();
+          if (prev_size > 0) 
+            car_s = end_path_s;
+          // too_close flat initiates looking into lane changes
+          bool too_close = false;
+          // Lane blocked flags to ensure the ar doesn't try to change lanes into
+          bool left_blocked = false;
+          bool right_blocked = false;
+
+          // Distance to car in front of to initiate lane change checks,
+          // check to make sure we are looking at the closest car
+          double center_closest = 60;
+          // Take speed readings to ensure we don't hit the car in front
+          double closest_speed = speed_limit;
 
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-			double dist_inc = 0.3;
-			for (int i = 0; i < 50; ++i) {
-			  double next_s = car_s+(i+1)*dist_inc;
-			  double next_d = 6;
-			  vector<double> xy = getXY(next_s, next_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          // Cycle through cars and check for ones that are in our lane in front of us
+          for (int i = 0; i < sensor_fusion.size(); i++) {
+            float d = sensor_fusion[i][6];
+            if (d < laneWidth * lane + laneWidth && d > laneWidth * lane) {
+              float vx = sensor_fusion[i][3];
+              float vy = sensor_fusion[i][4];
+              double check_speed = sqrt(pow(vx, 2) + pow(vy, 2)); // m/s
+              double check_car_s = sensor_fusion[i][5]; // check car position, meter
 
-			  next_x_vals.push_back(xy[0]);
-			  next_y_vals.push_back(xy[1]);
+              check_car_s += ((double)prev_size * 0.02 * check_speed);
+              double difference = check_car_s - car_s; // check distance between oour cars
+              // If distance within 60m, look for a lane change, 
+              // caculate speed in mph to start slow down
+              if(check_car_s > car_s && difference < center_closest) {
+                too_close = true;
+                center_closest = difference;
+                maintainLCost = speed_limit - (check_speed * 2.23694);
+                closest_speed = check_speed * 2.23694;
+              }
 
-			}
+            }
+
+            // Process car within 40m, slow to the speed of the car, 
+            // process no car within 40m, go to the speed limit,
+            // Process car within 20m, decrease speed to give cushion space
+            if (center_closest < 20) {
+              target_speed = closest_speed * 0.75;
+            } else if (center_closest < 40 && closest_speed <= speed_limit) {
+              target_speed = closest_speed;
+            } else {
+              target_speed = speed_limit;
+            }
+          }
+
+            // Variables to store target speed if car perform a lane change into
+            // a lane with a car going slower than speed limit
+            double left_lane_change_speed = speed_limit;
+            double right_lane_change_speed = speed_limit;
+            // Check for the cars in the left and right lanes, starting at 120m, 
+            // used to verify the closest car in front of our vehicle
+            double left_closest = 120.0;
+            double right_closest = 120.0;
+
+            // Check the car is already in the far lanes
+            if (0 == lane) {
+              left_blocked = true;
+            } else {
+              left_blocked = false;
+            }
+            if (lanes - 1 == lane) {
+              right_blocked = true;
+            } else {
+              right_blocked = false;
+            }
+
+
+            // Check for lane change opportunities
+            for (int i = 0; i < sensor_fusion.size(); ++i) {
+              float d = sensor_fusion[i][6];
+              //check for all cars in the left lane
+              if ((lane != 0) && (d < laneWidth * (lane - 1) + laneWidth) && (d > laneWidth * (lane - 1)) && !left_blocked) {
+                float vx = sensor_fusion[i][3];
+                float vy = sensor_fusion[i][4];
+                double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                double check_car_s = sensor_fusion[i][5];
+                check_car_s += ((double)prev_size * 0.02 * check_speed);
+                double difference = check_car_s - car_s;
+                // Check to make sure no car is within 20m in front of the car
+                // Check to make sure no car is within 8m behind the car
+                // Check to make sure no car is peeding up from 30m behind position
+                if ((difference < 20 && difference < -8) || (difference < -8 && difference > -30 && check_speed * 2.23694 > ref_vel)) {
+                  left_blocked = true;
+                  leftCarCount += 1;
+                }
+                // Check if the car is ahead of us, and if its the closest, and calculate its cost.
+                if (check_car_s > car_s && difference < left_closest) {
+                  leftLCCost = 10.0  + speed_limit - (check_speed * 2.23694);
+                  leftLCCost -= 0.2 * difference;
+                  left_closest = difference;
+                  left_lane_change_speed = check_speed * 2.23694;
+                  leftCarCount += 1;
+                }
+              } // End of Check cars in left lane 
+              // Check for all cars in the right lane
+              else if ( (lane != lanes -1) && (d < laneWidth * (lane + 1) + laneWidth) && (d > laneWidth * (lane + 1)) && !right_blocked) {
+                float vx = sensor_fusion[i][3];
+                float vy = sensor_fusion[i][4];
+                double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                double check_car_s = sensor_fusion[i][5];
+                check_car_s += ((double)prev_size * 0.02 * check_speed);
+                double difference = check_car_s - car_s;
+                if ((difference < 20 && difference < -8) || (difference < -8 && difference > -30 && check_speed * 2.23694 > ref_vel) || (lane == lanes -1) ) {
+                  right_blocked  = true;
+                  rightCarCount += 1;
+                }
+                if (check_car_s > car_s && difference < right_closest) {
+                  rightLCCost = 10.0 + speed_limit - (check_speed * 2.23694);
+                  rightLCCost -= 0.2 * difference;
+                  right_lane_change_speed = check_speed * 2.23694;
+                  rightCarCount += 1;
+                } 
+              } // End of Check cars in right lane
+            } // End of Check for lane changes
+          // } // End of Check cars in front of us
+
+          // Set costs very low if there are no cars ahead of us in the respective lane
+          if (0 == leftCarCount) {
+            leftLCCost = 5;
+          }
+          if (0 == rightCarCount) {
+            rightLCCost = 5;
+          }
+
+
+          cout <<"Current Lane: " << lane << endl << "Last Lane Change: " << car_s - last_lane_change << " Meters ago" << endl << "MAINTAIN COST: " << int(maintainLCost) << endl << "LEFT COST:     " << int(leftLCCost) << " " << left_blocked << endl << "RIGHT COST:    " << int(rightLCCost) << " " << right_blocked << endl;
+
+          // Compare costs to make a decision whether or not to change the lane:
+          // If lane change occurs, match speed to car ahead if its lower than others.
+          // If a lane change has occurred in the last 100m, do not perform again.
+          if (too_close) {
+            if (leftLCCost < maintainLCost && (leftLCCost <= rightLCCost || right_blocked) && !left_blocked && abs(car_s - last_lane_change) > 100.0) {
+              lane -= 1;
+              last_lane_change = car_s;
+              target_speed = left_lane_change_speed;
+            } else if(rightLCCost < maintainLCost && !right_blocked && abs(car_s - last_lane_change) > 100.0) {
+              lane += 1;
+              last_lane_change = car_s;
+              target_speed = right_lane_change_speed;
+            }
+          }
+
+          // Ramp ref_vel up or down at a reasonable rate
+          if (target_speed < ref_vel) {
+
+            ref_vel -= 0.224;
+          } else if(target_speed > ref_vel) {
+            ref_vel += 0.224;
+          }
+
+          //Pulled most of this from the video help section on the project page.
+          vector<double> ptsx;
+          vector<double> ptsy;
+            
+          double ref_x = car_x;
+          double ref_y = car_y;
+          double ref_yaw = deg2rad(car_yaw);
+          cout << "ref_x = " << ref_x << endl << "ref_y = " << ref_y << endl << "ref_yaw = " << ref_yaw << endl;
+            
+          if(prev_size < 2) {
+            double prev_car_x = car_x - cos(car_yaw);
+            double prev_car_y = car_y - sin(car_yaw);
+            
+            ptsx.push_back(prev_car_x);
+            ptsx.push_back(car_x);
+            
+            ptsy.push_back(prev_car_y);
+            ptsy.push_back(prev_car_y);
+          } else {
+            ref_x = previous_path_x[prev_size - 1];
+            ref_y = previous_path_y[prev_size - 1];
+            
+            double ref_x_prev = previous_path_x[prev_size - 2];
+            double ref_y_prev = previous_path_y[prev_size - 2];
+            ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+            
+            ptsx.push_back(ref_x_prev);
+            ptsx.push_back(ref_x);
+            
+            ptsy.push_back(ref_y_prev);
+            ptsy.push_back(ref_y);
+          }
+            
+          vector<double> next_wp0 = getXY(car_s + 30, (laneWidth/2 + laneWidth * lane ), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          vector<double> next_wp1 = getXY(car_s + 60, (laneWidth/2 + laneWidth * lane ), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          vector<double> next_wp2 = getXY(car_s + 90, (laneWidth/2 + laneWidth * lane ), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          
+          ptsx.push_back(next_wp0[0]);
+          ptsx.push_back(next_wp1[0]);
+          ptsx.push_back(next_wp2[0]);
+          
+          ptsy.push_back(next_wp0[1]);
+          ptsy.push_back(next_wp1[1]);
+          ptsy.push_back(next_wp2[1]);
+          
+          for( int i = 0; i < ptsx.size(); i++ )
+          {
+            double shift_x = ptsx[i] - ref_x;
+            double shift_y = ptsy[i] - ref_y;
+            
+            ptsx[i] = (shift_x * cos( 0 - ref_yaw) - shift_y * sin( 0 - ref_yaw));
+            ptsy[i] = (shift_x * sin( 0 - ref_yaw) + shift_y * cos( 0 - ref_yaw));
+          }
+          
+          tk::spline s;
+          cout << "(" << ptsx[1] << "," << ptsy[1] << ")" << endl;
+          s.set_points(ptsx, ptsy);
+
+          json msgJson;
+
+          vector<double> next_x_vals;
+          vector<double> next_y_vals;
+
+
+          // TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+			    /*
+          double dist_inc = 0.3;
+			    for (int i = 0; i < 50; ++i) {
+			     double next_s = car_s+(i+1)*dist_inc;
+			     double next_d = 6;
+			     vector<double> xy = getXY(next_s, next_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+			     next_x_vals.push_back(xy[0]);
+			     next_y_vals.push_back(xy[1]);
+
+			    }*/
+
+          for (int i = 0; i < previous_path_x.size(); ++i) {
+            next_x_vals.push_back(previous_path_x[i]);
+            next_y_vals.push_back(previous_path_y[i]);
+          }
+          double target_x = 30.0;
+          double target_y = s(target_x);
+          double target_dist = sqrt(pow(target_x, 2) + pow(target_y, 2));
+
+          double x_add_on = 0;
+          for (int i =0 ; i < 50 - previous_path_x.size(); ++i) {
+            double N = (target_dist / (0.02 * ref_vel /2.24));
+            double x_point = x_add_on + target_x / N;
+            double y_point = s(x_point);
+
+            x_add_on = x_point;
+              
+            double x_ref = x_point;
+            double y_ref = y_point;
+            
+            x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw));
+            y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw));
+            
+            x_point += ref_x;
+            y_point += ref_y;
+            
+            next_x_vals.push_back(x_point);
+            next_y_vals.push_back(y_point);
+
+          }
 
 			// End
           	msgJson["next_x"] = next_x_vals;
