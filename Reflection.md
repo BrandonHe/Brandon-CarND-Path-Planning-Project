@@ -1,5 +1,9 @@
 # Reflection
 
+
+[image1]: ./build/term3-p1.png "EKF"
+[image2]: ./build/term3-p1-1.png "EKF"
+
 This is a reflection on how to generate paths
 -----
 The project began with learning of Walkthrough and Q&A, the Started video helped me to get the car moving straight, moving in the lane, and the other function mentioned in the video are also very useful to develop the project. I use the S function to get the help localization data and map the waypoints. For a vehicle lane change, I use the cost function instead of hybrided star to iterately analyze the other vehicles on the road. The lane change opportunities are checked from left lane to right lane.
@@ -9,6 +13,9 @@ Three conditions are consided in speed control:
 - Have Vehicles in front of more than 40 meters
 - Have vehicles between 20 meters and 40 meters
 - Have vehicles less than 20 meters
+
 The car should run at the speed limit in the first condition, in the second condition the car will run at the same speed of the closest car, and in the third condition, the car should brake the speed to avoid of collision. If the closest car in front of us is too close, we should set the too_close to true and consider whether it is avaiable to perform a lane change, and if the left lane change cost is less than right lane change cost, we will consider to perform a left lane change, otherwise, we will consider to perform a right lane change.
 
-[image1]: ./build/term3-p1.png "EKF"
+Below are the screenshot during the project running:
+![alt text][image1]
+![alt text][image2]
